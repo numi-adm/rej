@@ -17,10 +17,10 @@ from rich import box
 # ==============================================================================
 # ตั้งค่าระบบรวม (Global Configuration)
 # ==============================================================================
-CHECK_INTERVAL = 10           # ระยะเวลาสแกนสถานะทุกรอบ (วินาที) - เช็กในเครื่องไม่ต้องกลัวติด 429
+CHECK_INTERVAL = 10           # ระยะเวลาสแกนสถานะทุกรอบ (วินาที)
 REJOIN_DELAY = 35             # ระยะเวลารอให้เกมโหลดหลังจากสั่งเปิด 1 จอ (วินาที)
 USE_ROOT = True               # True = ใช้สิทธิ์ Root (su), False = ใช้ ADB (Wireless Debugging)
-CHECK_DISCONNECTED_UI = True  # True = เช็กข้อความ Disconnected บนหน้าจอด้วย (แก้ค้างหน้าหลุดแต่แอปไม่ปิด)
+CHECK_DISCONNECTED_UI = True  # True = เช็กข้อความ Disconnected บนหน้าจอด้วย
 
 # ==============================================================================
 # ตั้งค่าบัญชีและแอปโคลน (Multi-Account & Clone Apps Configuration)
@@ -96,8 +96,6 @@ def get_running_roblox_instances(use_root: bool):
             continue
 
         proc_user, pid, proc_name = parts[0], parts[1], parts[2]
-
-        # ข้ามโปรเซสย่อย เช่น com.roblox.client:WebView หรือ sandboxed_process
         if ":" in proc_name:
             continue
 
@@ -222,4 +220,44 @@ def main():
                     is_running = key in running_instances
                     is_screen_dc = (
                         disconnected_pkg is not None
-                        and (disconnected_pkg == pkg or (disconnected_pkg == "UNKNOWN_ROBLOX_PKG" and len(ACCOUNTS) == 1))
+                        and (
+                            disconnected_pkg == pkg
+                            or (disconnected_pkg == "UNKNOWN_ROBLOX_PKG" and len(ACCOUNTS) == 1)
+                        )
+                    )
+
+                    if is_running and not is_screen_dc:
+                        pid = running_instances[key]
+                        account_states[idx]["pid"] = pid
+                        account_states[idx]["status_text"] = "[bold green]🟢 กำลังรันอยู่ (Running)[/bold green]"
+                    else:
+                        reason = "หน้าจอขึ้น Disconnected" if is_screen_dc else "ปิดอยู่ / แอปเด้งหลุด"
+                        account_states[idx]["pid"] = "-"
+                        account_states[idx]["status_text"] = f"[bold red]🔴 {reason}[/bold red]"
+                        account_states[idx]["rejoin_count"] += 1
+                        account_states[idx]["last_rejoin"] = datetime.now().strftime("%H:%M:%S")
+
+                        add_log(f"[bold yellow]{name}[/bold yellow] ({pkg}) {reason} -> กำลังเปิดแอปใหม่...")
+                        live.update(generate_ui(f"[bold yellow]กำลังดึง {name} กลับเข้าแมพ...[/bold yellow]"))
+
+                        launch_clone_instance(acc, USE_ROOT)
+
+                        for sec in range(REJOIN_DELAY, 0, -1):
+                            account_states[idx]["status_text"] = f"[bold yellow]⏳ กำลังโหลดเกม ({sec}s)...[/bold yellow]"
+                            live.update(generate_ui(f"[yellow]รอ {name} โหลดเข้าเกม ({sec} วินาที)...[/yellow]"))
+                            time.sleep(1)
+
+                        account_states[idx]["status_text"] = "[cyan]สั่งเปิดแล้ว (รอสแกนรอบถัดไป)[/cyan]"
+                        add_log(f"เปิดแอปให้ [bold green]{name}[/bold green] เรียบร้อยแล้ว")
+
+                for sec in range(CHECK_INTERVAL, 0, -1):
+                    live.update(generate_ui(f"[green]ปกติ[/green] - สแกนรอบถัดไปใน [bold white]{sec}[/bold white] วินาที"))
+                    time.sleep(1)
+
+        except KeyboardInterrupt:
+            pass
+
+    console.print("\n[bold yellow]หยุดการทำงานของระบบเรียบร้อยแล้ว[/bold yellow]")
+
+if __name__ == "__main__":
+    main()
