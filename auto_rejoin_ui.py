@@ -2,9 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import time
-import json
-import urllib.request
-import urllib.error
+import re
 import subprocess
 from datetime import datetime
 from collections import deque
@@ -19,9 +17,10 @@ from rich import box
 # ==============================================================================
 # ตั้งค่าระบบรวม (Global Configuration)
 # ==============================================================================
-CHECK_INTERVAL = 45           # ระยะเวลาเช็คสถานะทุกรอบ (วินาที) - เพิ่มเป็น 45s ลดโอกาสติด 429
+CHECK_INTERVAL = 10           # ระยะเวลาสแกนสถานะทุกรอบ (วินาที) - เช็กในเครื่องไม่ต้องกลัวติด 429
 REJOIN_DELAY = 35             # ระยะเวลารอให้เกมโหลดหลังจากสั่งเปิด 1 จอ (วินาที)
 USE_ROOT = True               # True = ใช้สิทธิ์ Root (su), False = ใช้ ADB (Wireless Debugging)
+CHECK_DISCONNECTED_UI = True  # True = เช็กข้อความ Disconnected บนหน้าจอด้วย (แก้ค้างหน้าหลุดแต่แอปไม่ปิด)
 
 # ==============================================================================
 # ตั้งค่าบัญชีและแอปโคลน (Multi-Account & Clone Apps Configuration)
@@ -29,13 +28,19 @@ USE_ROOT = True               # True = ใช้สิทธิ์ Root (su), Fa
 ACCOUNTS = [
     {
         "name": "ID_หลัก_1",
-        "user_id": 2267991284,                  # User ID ของคุณ
         "place_id": 8304191830,                 # Place ID ของแมพ
         "link_code": "",                        # ใส่ VIP Server Link Code (ถ้ามี)
         "package": "com.roblox.client",         # ชื่อ Package ของแอป Roblox ตัวหลัก
-        "android_user_id": 0,                   # 0 = ระบบหลัก
-        "cookie": ""                            # .ROBLOSECURITY (ใส่เฉพาะกรณีปิดสถานะออนไลน์)
-    }
+        "android_user_id": 0                    # 0 = ระบบหลัก (หรือใส่ 999 / 10 สำหรับ Dual App)
+    },
+    # ตัวอย่างการเพิ่มจอโคลนตัวที่ 2 (เอาเครื่องหมาย # ออกหากต้องการใช้งาน):
+    # {
+    #     "name": "ID_ไก่_2",
+    #     "place_id": 8304191830,
+    #     "link_code": "",
+    #     "package": "com.roblox.client2",
+    #     "android_user_id": 0
+    # }
 ]
 
 # ==============================================================================
@@ -44,85 +49,96 @@ ACCOUNTS = [
 console = Console()
 logs = deque(maxlen=8)  # เก็บประวัติการทำงานล่าสุด 8 บรรทัด
 
-account_states = {}
+account_states = []
 for acc in ACCOUNTS:
-    account_states[acc["user_id"]] = {
+    account_states.append({
         "status_text": "[dim]รอตรวจสอบ...[/dim]",
         "rejoin_count": 0,
-        "last_rejoin": "-"
-    }
+        "last_rejoin": "-",
+        "pid": "-"
+    })
 
 def add_log(message: str):
     now = datetime.now().strftime("%H:%M:%S")
     logs.append(f"[dim][{now}][/dim] {message}")
 
-def check_batch_presence(accounts):
-    url = "https://presence.roblox.com/v1/presence/users"
-    results = {}
+def get_shell_output(cmd: str, use_root: bool) -> str:
+    full_cmd = f"su -c '{cmd}'" if use_root else f"adb shell {cmd}"
+    try:
+        res = subprocess.run(
+            full_cmd,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=10
+        )
+        return res.stdout or ""
+    except Exception as e:
+        add_log(f"[bold red]Shell Error:[/bold red] {e}")
+        return ""
 
-    has_cookies = any(acc.get("cookie") for acc in accounts)
-    if not has_cookies:
-        user_ids = [acc["user_id"] for acc in accounts]
-        payload = json.dumps({"userIds": user_ids}).encode("utf-8")
-        headers = {
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-        }
-        req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
-        try:
-            with urllib.request.urlopen(req, timeout=10) as response:
-                if response.status == 200:
-                    data = json.loads(response.read().decode("utf-8"))
-                    for item in data.get("userPresences", []):
-                        results[item["userId"]] = item["userPresenceType"]
-                    return results
-        except urllib.error.HTTPError as e:
-            if e.code == 429:
-                add_log("[bold red]Error 429:[/bold red] โดนจำกัดคำขอ (Too Many Requests)")
-                return "RATE_LIMITED"
-            add_log(f"[bold red]Error:[/bold red] HTTP {e.code} ({e.reason})")
-            return None
-        except Exception as e:
-            add_log(f"[bold red]Error:[/bold red] เชื่อมต่อ API ล้มเหลว ({e})")
-            return None
-
-    for acc in accounts:
-        uid = acc["user_id"]
-        cookie = acc.get("cookie", "")
-        payload = json.dumps({"userIds": [uid]}).encode("utf-8")
-        headers = {
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-        }
-        if cookie:
-            headers["Cookie"] = f".ROBLOSECURITY={cookie}"
-        req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
-        try:
-            with urllib.request.urlopen(req, timeout=10) as response:
-                if response.status == 200:
-                    data = json.loads(response.read().decode("utf-8"))
-                    presences = data.get("userPresences", [])
-                    if presences:
-                        results[uid] = presences[0]["userPresenceType"]
-        except urllib.error.HTTPError as e:
-            if e.code == 429:
-                add_log(f"[bold red]Error 429:[/bold red] {acc['name']} โดนจำกัดคำขอ")
-                return "RATE_LIMITED"
-            add_log(f"[bold red]Error:[/bold red] เช็ค {acc['name']} ล้มเหลว (HTTP {e.code})")
-            results[uid] = None
-        except Exception as e:
-            add_log(f"[bold red]Error:[/bold red] เช็ค {acc['name']} ล้มเหลว ({e})")
-            results[uid] = None
-
-    return results
-
-def run_shell_cmd(cmd, use_root):
+def run_shell_cmd(cmd: str, use_root: bool):
     full_cmd = f"su -c '{cmd}'" if use_root else f"adb shell {cmd}"
     subprocess.run(full_cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-def launch_clone_instance(account, use_root):
+def get_running_roblox_instances(use_root: bool):
+    """
+    ตรวจหารายชื่อโปรเซสของ Roblox ที่กำลังทำงานอยู่บนเครื่อง
+    คืนค่าเป็น dict: {(android_user_id, package_name): pid}
+    """
+    output = get_shell_output("ps -A -o USER,PID,NAME", use_root)
+    running = {}
+
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+
+        proc_user, pid, proc_name = parts[0], parts[1], parts[2]
+
+        # ข้ามโปรเซสย่อย เช่น com.roblox.client:WebView หรือ sandboxed_process
+        if ":" in proc_name:
+            continue
+
+        if "roblox" in proc_name.lower():
+            m = re.match(r"^u(\d+)_", proc_user)
+            android_uid = int(m.group(1)) if m else 0
+            running[(android_uid, proc_name)] = pid
+
+    return running
+
+def check_screen_disconnected(use_root: bool):
+    """
+    ตรวจสอบหน้าจอปัจจุบันว่ามีหน้าต่าง Disconnected / Error Code ค้างอยู่หรือไม่
+    คืนค่าชื่อ package ที่กำลังค้างหน้า Disconnected (หรือ None หากปกติ)
+    """
+    if not CHECK_DISCONNECTED_UI:
+        return None
+
+    xml_data = get_shell_output("uiautomator dump /dev/tty", use_root)
+    if not xml_data:
+        return None
+
+    lower_xml = xml_data.lower()
+    disconnect_keywords = [
+        "disconnected",
+        "error code:",
+        "lost connection",
+        "same account launched",
+        "kicked by server",
+        "idle for 20 minutes"
+    ]
+
+    if any(kw in lower_xml for kw in disconnect_keywords):
+        m = re.search(r'package="([^"]*roblox[^"]*)"', xml_data, re.IGNORECASE)
+        if m:
+            return m.group(1)
+        return "UNKNOWN_ROBLOX_PKG"
+
+    return None
+
+def launch_clone_instance(account: dict, use_root: bool):
     pkg = account["package"]
     place_id = account["place_id"]
     link_code = account.get("link_code", "")
@@ -142,33 +158,36 @@ def launch_clone_instance(account, use_root):
     run_shell_cmd(start_cmd, use_root)
 
 def generate_ui(status_banner: str) -> Panel:
-    # 1. สร้างตารางแสดงสถานะบัญชี
     table = Table(box=box.ROUNDED, expand=True, border_style="cyan")
     table.add_column("ชื่อบัญชี", style="bold white", justify="left")
     table.add_column("Package / User", style="dim", justify="left")
-    table.add_column("สถานะปัจจุบัน", justify="center")
+    table.add_column("PID", style="cyan", justify="center")
+    table.add_column("สถานะบนเครื่อง", justify="center")
     table.add_column("Rejoin", style="yellow", justify="center")
-    table.add_column("ดึงกลับล่าสุด", style="dim", justify="center")
+    table.add_column("เปิดใหม่ล่าสุด", style="dim", justify="center")
 
-    for acc in ACCOUNTS:
-        uid = acc["user_id"]
-        state = account_states[uid]
+    for idx, acc in enumerate(ACCOUNTS):
+        state = account_states[idx]
         pkg_info = f"{acc['package']} (u{acc.get('android_user_id', 0)})"
         table.add_row(
             acc["name"],
             pkg_info,
+            state["pid"],
             state["status_text"],
             str(state["rejoin_count"]),
             state["last_rejoin"]
         )
 
-    # 2. กล่องแสดง Log
     log_content = "\n".join(logs) if logs else "[dim]ยังไม่มีประวัติการทำงาน...[/dim]"
     log_panel = Panel(log_content, title="[bold]บันทึกการทำงาน (Logs)[/bold]", border_style="bright_black", box=box.ROUNDED)
 
-    # 3. แถบสถานะด้านล่าง
     mode_text = "ROOT (su)" if USE_ROOT else "ADB Wireless"
-    footer = Text.from_markup(f"โหมดสิทธิ์: [bold green]{mode_text}[/bold green]  |  สถานะระบบ: {status_banner}")
+    ui_check_text = "เปิด" if CHECK_DISCONNECTED_UI else "ปิด"
+    footer = Text.from_markup(
+        f"โหมดสิทธิ์: [bold green]{mode_text}[/bold green]  |  "
+        f"เช็กหน้าจอหลุด: [bold cyan]{ui_check_text}[/bold cyan]  |  "
+        f"สถานะ: {status_banner}"
+    )
 
     ui_group = Group(
         table,
@@ -178,75 +197,29 @@ def generate_ui(status_banner: str) -> Panel:
 
     return Panel(
         ui_group,
-        title="[bold cyan]🎮 ROBLOX AUTO REJOIN MANAGER (MULTI-INSTANCE)[/bold cyan]",
+        title="[bold cyan]🎮 ROBLOX LOCAL PROCESS & SCREEN MONITOR[/bold cyan]",
         subtitle="[dim]กด Ctrl + C เพื่อหยุดการทำงาน[/dim]",
         border_style="bright_cyan",
         padding=(1, 1)
     )
 
 def main():
-    add_log("เริ่มต้นระบบตรวจสอบอัตโนมัติ...")
-    backoff_sec = 0
+    add_log("เริ่มต้นระบบตรวจจับโปรเซสและหน้าจอบนเครื่อง...")
 
     with Live(generate_ui("[yellow]กำลังเริ่มต้น...[/yellow]"), console=console, refresh_per_second=4, screen=True) as live:
         try:
             while True:
-                live.update(generate_ui("[bold cyan]กำลังตรวจสอบสถานะ API...[/bold cyan]"))
-                presences = check_batch_presence(ACCOUNTS)
+                live.update(generate_ui("[bold cyan]กำลังสแกนโปรเซสและหน้าจอ...[/bold cyan]"))
+                running_instances = get_running_roblox_instances(USE_ROOT)
+                disconnected_pkg = check_screen_disconnected(USE_ROOT)
 
-                if presences == "RATE_LIMITED":
-                    backoff_sec = 60 if backoff_sec == 0 else min(backoff_sec * 2, 300)
-                    add_log(f"[yellow]พักการยิง API ชั่วคราว {backoff_sec} วินาที...[/yellow]")
-                    for sec in range(backoff_sec, 0, -1):
-                        live.update(generate_ui(f"[bold red]ติด Rate Limit (429)[/bold red] รอ {sec} วินาที..."))
-                        time.sleep(1)
-                    continue
-
-                if presences is None:
-                    for sec in range(CHECK_INTERVAL, 0, -1):
-                        live.update(generate_ui(f"[bold red]API ขัดข้อง[/bold red] รอเช็คใหม่ใน {sec} วินาที..."))
-                        time.sleep(1)
-                    continue
-
-                # กลับมาใช้งานได้ปกติ รีเซ็ตตัวหน่วง 429
-                backoff_sec = 0
-
-                for acc in ACCOUNTS:
-                    uid = acc["user_id"]
+                for idx, acc in enumerate(ACCOUNTS):
                     name = acc["name"]
-                    status = presences.get(uid)
+                    pkg = acc["package"]
+                    android_uid = acc.get("android_user_id", 0)
+                    key = (android_uid, pkg)
 
-                    if status is None:
-                        account_states[uid]["status_text"] = "[bold red]API Error[/bold red]"
-                    elif status == 2:
-                        account_states[uid]["status_text"] = "[bold green]🟢 อยู่ในเกม (In-Game)[/bold green]"
-                    else:
-                        status_label = "หน้าล็อบบี้ (Online)" if status == 1 else "ออฟไลน์ (Offline)"
-                        account_states[uid]["status_text"] = f"[bold red]🔴 หลุด ({status_label})[/bold red]"
-                        account_states[uid]["rejoin_count"] += 1
-                        account_states[uid]["last_rejoin"] = datetime.now().strftime("%H:%M:%S")
-
-                        add_log(f"[bold yellow]{name}[/bold yellow] หลุดออกจากเกม -> กำลังสั่งเปิดแอปใหม่...")
-                        live.update(generate_ui(f"[bold yellow]กำลังดึง {name} กลับเข้าเซิร์ฟเวอร์...[/bold yellow]"))
-
-                        launch_clone_instance(acc, USE_ROOT)
-
-                        for sec in range(REJOIN_DELAY, 0, -1):
-                            account_states[uid]["status_text"] = f"[bold yellow]⏳ กำลังโหลดเกม ({sec}s)...[/bold yellow]"
-                            live.update(generate_ui(f"[yellow]รอ {name} โหลดเข้าเกม ({sec} วินาที)...[/yellow]"))
-                            time.sleep(1)
-
-                        account_states[uid]["status_text"] = "[cyan]ส่งคำสั่งแล้ว (รอเช็ครอบถัดไป)[/cyan]"
-                        add_log(f"เปิดแอปให้ [bold green]{name}[/bold green] เรียบร้อยแล้ว")
-
-                for sec in range(CHECK_INTERVAL, 0, -1):
-                    live.update(generate_ui(f"[green]ปกติ[/green] - เช็ครอบถัดไปใน [bold white]{sec}[/bold white] วินาที"))
-                    time.sleep(1)
-
-        except KeyboardInterrupt:
-            pass
-
-    console.print("\n[bold yellow]หยุดการทำงานของระบบ Auto Rejoin เรียบร้อยแล้ว[/bold yellow]")
-
-if __name__ == "__main__":
-    main()
+                    is_running = key in running_instances
+                    is_screen_dc = (
+                        disconnected_pkg is not None
+                        and (disconnected_pkg == pkg or (disconnected_pkg == "UNKNOWN_ROBLOX_PKG" and len(ACCOUNTS) == 1))
