@@ -19,7 +19,7 @@ from rich import box
 # ==============================================================================
 # ตั้งค่าระบบรวม (Global Configuration)
 # ==============================================================================
-CHECK_INTERVAL = 20           # ระยะเวลาเช็คสถานะทุกรอบ (วินาที)
+CHECK_INTERVAL = 45           # ระยะเวลาเช็คสถานะทุกรอบ (วินาที) - เพิ่มเป็น 45s ลดโอกาสติด 429
 REJOIN_DELAY = 35             # ระยะเวลารอให้เกมโหลดหลังจากสั่งเปิด 1 จอ (วินาที)
 USE_ROOT = True               # True = ใช้สิทธิ์ Root (su), False = ใช้ ADB (Wireless Debugging)
 
@@ -67,7 +67,7 @@ def check_batch_presence(accounts):
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json",
-            "User-Agent": "Mozilla/5.0 (Android; Termux)"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
         }
         req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
         try:
@@ -77,6 +77,12 @@ def check_batch_presence(accounts):
                     for item in data.get("userPresences", []):
                         results[item["userId"]] = item["userPresenceType"]
                     return results
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                add_log("[bold red]Error 429:[/bold red] โดนจำกัดคำขอ (Too Many Requests)")
+                return "RATE_LIMITED"
+            add_log(f"[bold red]Error:[/bold red] HTTP {e.code} ({e.reason})")
+            return None
         except Exception as e:
             add_log(f"[bold red]Error:[/bold red] เชื่อมต่อ API ล้มเหลว ({e})")
             return None
@@ -88,7 +94,7 @@ def check_batch_presence(accounts):
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json",
-            "User-Agent": "Mozilla/5.0 (Android; Termux)"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
         }
         if cookie:
             headers["Cookie"] = f".ROBLOSECURITY={cookie}"
@@ -100,8 +106,14 @@ def check_batch_presence(accounts):
                     presences = data.get("userPresences", [])
                     if presences:
                         results[uid] = presences[0]["userPresenceType"]
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                add_log(f"[bold red]Error 429:[/bold red] {acc['name']} โดนจำกัดคำขอ")
+                return "RATE_LIMITED"
+            add_log(f"[bold red]Error:[/bold red] เช็ค {acc['name']} ล้มเหลว (HTTP {e.code})")
+            results[uid] = None
         except Exception as e:
-            add_log(f"[bold red]Error:[/bold red] เช็ค {acc['name']} ล้มเหลว")
+            add_log(f"[bold red]Error:[/bold red] เช็ค {acc['name']} ล้มเหลว ({e})")
             results[uid] = None
 
     return results
@@ -174,6 +186,7 @@ def generate_ui(status_banner: str) -> Panel:
 
 def main():
     add_log("เริ่มต้นระบบตรวจสอบอัตโนมัติ...")
+    backoff_sec = 0
 
     with Live(generate_ui("[yellow]กำลังเริ่มต้น...[/yellow]"), console=console, refresh_per_second=4, screen=True) as live:
         try:
@@ -181,11 +194,22 @@ def main():
                 live.update(generate_ui("[bold cyan]กำลังตรวจสอบสถานะ API...[/bold cyan]"))
                 presences = check_batch_presence(ACCOUNTS)
 
+                if presences == "RATE_LIMITED":
+                    backoff_sec = 60 if backoff_sec == 0 else min(backoff_sec * 2, 300)
+                    add_log(f"[yellow]พักการยิง API ชั่วคราว {backoff_sec} วินาที...[/yellow]")
+                    for sec in range(backoff_sec, 0, -1):
+                        live.update(generate_ui(f"[bold red]ติด Rate Limit (429)[/bold red] รอ {sec} วินาที..."))
+                        time.sleep(1)
+                    continue
+
                 if presences is None:
                     for sec in range(CHECK_INTERVAL, 0, -1):
                         live.update(generate_ui(f"[bold red]API ขัดข้อง[/bold red] รอเช็คใหม่ใน {sec} วินาที..."))
                         time.sleep(1)
                     continue
+
+                # กลับมาใช้งานได้ปกติ รีเซ็ตตัวหน่วง 429
+                backoff_sec = 0
 
                 for acc in ACCOUNTS:
                     uid = acc["user_id"]
@@ -215,7 +239,6 @@ def main():
                         account_states[uid]["status_text"] = "[cyan]ส่งคำสั่งแล้ว (รอเช็ครอบถัดไป)[/cyan]"
                         add_log(f"เปิดแอปให้ [bold green]{name}[/bold green] เรียบร้อยแล้ว")
 
-                # นับถอยหลังรอเช็ครอบถัดไป
                 for sec in range(CHECK_INTERVAL, 0, -1):
                     live.update(generate_ui(f"[green]ปกติ[/green] - เช็ครอบถัดไปใน [bold white]{sec}[/bold white] วินาที"))
                     time.sleep(1)
